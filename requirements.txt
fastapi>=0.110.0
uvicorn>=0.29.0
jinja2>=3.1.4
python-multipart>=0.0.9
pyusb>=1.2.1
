@@ -1,0 +1,120 @@
+const statusBox = document.getElementById('status-box');
+const deviceList = document.getElementById('device-list');
+const jobsList = document.getElementById('jobs-list');
+const uploadForm = document.getElementById('upload-form');
+const jobForm = document.getElementById('job-form');
+const uploadResult = document.getElementById('upload-result');
+const jobDevice = document.getElementById('job-device');
+const jobFilename = document.getElementById('job-filename');
+
+async function loadStatus() {
+  const response = await fetch('/api/status');
+  const data = await response.json();
+  statusBox.textContent = JSON.stringify(data, null, 2);
+}
+
+async function loadDevices() {
+  const response = await fetch('/api/devices');
+  const data = await response.json();
+  const devices = data.devices || [];
+  deviceList.innerHTML = '';
+  jobDevice.innerHTML = '';
+
+  devices.forEach((device) => {
+    const item = document.createElement('li');
+    item.textContent = `${device.name} (${device.kind}) - ${device.status}`;
+    deviceList.appendChild(item);
+
+    const option = document.createElement('option');
+    option.value = device.id;
+    option.textContent = `${device.name} (${device.kind})`;
+    jobDevice.appendChild(option);
+  });
+}
+
+async function loadJobs() {
+  const response = await fetch('/api/jobs');
+  const data = await response.json();
+  const jobs = data.jobs || [];
+  jobsList.innerHTML = '';
+
+  if (!jobs.length) {
+    jobsList.innerHTML = '<div class="job-card">No jobs yet.</div>';
+    return;
+  }
+
+  jobs.forEach((job) => {
+    const card = document.createElement('div');
+    card.className = 'job-card';
+    card.innerHTML = `
+      <strong>${job.filename}</strong>
+      <span>ID: ${job.id}</span>
+      <span>Status: ${job.status}</span>
+      <div class="progress-bar"><span class="progress-fill" style="width:${job.progress}%"></span></div>
+      <div>Progress: ${job.progress}%</div>
+      <div>
+        <button class="secondary" data-action="cancel" data-id="${job.id}">Cancel</button>
+        <button data-action="start" data-id="${job.id}">Start</button>
+      </div>
+    `;
+    jobsList.appendChild(card);
+  });
+}
+
+uploadForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const formData = new FormData(uploadForm);
+  const response = await fetch('/api/upload', {
+    method: 'POST',
+    body: formData,
+  });
+  const result = await response.json();
+  uploadResult.textContent = `Uploaded: ${result.filename}`;
+  jobFilename.value = result.filename;
+  await loadJobs();
+});
+
+jobForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const formData = new FormData();
+  formData.append('filename', jobFilename.value);
+  formData.append('device_id', jobDevice.value);
+  formData.append('speed', document.getElementById('job-speed').value);
+  formData.append('pressure', document.getElementById('job-pressure').value);
+  formData.append('tool', document.getElementById('job-tool').value);
+
+  const response = await fetch('/api/jobs', {
+    method: 'POST',
+    body: formData,
+  });
+  const data = await response.json();
+  uploadResult.textContent = `Job queued: ${data.job.id}`;
+  await loadJobs();
+});
+
+jobsList.addEventListener('click', async (event) => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  const id = button.dataset.id;
+  const action = button.dataset.action;
+
+  if (action === 'start') {
+    await fetch(`/api/jobs/${id}/start`, { method: 'POST' });
+  }
+
+  if (action === 'cancel') {
+    await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' });
+  }
+
+  await loadJobs();
+});
+
+setInterval(async () => {
+  await loadStatus();
+  await loadDevices();
+  await loadJobs();
+}, 3000);
+
+loadStatus();
+loadDevices();
+loadJobs();

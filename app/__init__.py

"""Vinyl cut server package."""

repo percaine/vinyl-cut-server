@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import asyncio
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from app.models import CutJob, JobState
+
+
+class CutterDriver:
+    async def run_job(self, job: CutJob, update_callback) -> None:
+        job.status = JobState.preparing
+        job.logs.append("Preparing cutter session")
+        update_callback(job)
+        await asyncio.sleep(1)
+
+        job.status = JobState.cutting
+        job.logs.append(f"Starting job on device {job.device_id}")
+        update_callback(job)
+
+        for percent in range(0, 101, 10):
+            await asyncio.sleep(0.5)
+            job.progress = percent
+            job.logs.append(f"Cut progress: {percent}%")
+            update_callback(job)
+            if job.status == JobState.cancelled:
+                job.logs.append("Job cancelled by user")
+                update_callback(job)
+                return
+
+        if job.status == JobState.cancelled:
+            return
+
+        job.status = JobState.completed
+        job.progress = 100
+        job.logs.append("Cut completed successfully")
+        update_callback(job)
+
+
+class JobQueue:
+    def __init__(self) -> None:
+        self.jobs: Dict[str, CutJob] = {}
+        self._tasks: Dict[str, asyncio.Task] = {}
+
+    def create_job(self, filename: str, device_id: Optional[str], settings: Dict[str, Any]) -> CutJob:
+        job = CutJob(
+            id=f"job-{len(self.jobs) + 1:04d}",
+            filename=filename,
+            device_id=device_id,
+            settings=settings,
+        )
+        self.jobs[job.id] = job
+        return job
+
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        return [job.to_dict() for job in self.jobs.values()]
+
+    def get_job(self, job_id: str) -> Optional[CutJob]:
+        return self.jobs.get(job_id)
+
+    def cancel_job(self, job_id: str) -> Optional[CutJob]:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+            return job
+        job.status = JobState.cancelled
+        job.updated_at = datetime.now(timezone.utc).isoformat()
+        job.logs.append("Cancellation requested")
+        return job
+
+    def start_job(self, job_id: str, driver: CutterDriver, on_update) -> Optional[CutJob]:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+            return job
+        task = asyncio.create_task(driver.run_job(job, on_update))
+        self._tasks[job.id] = task
+        return job

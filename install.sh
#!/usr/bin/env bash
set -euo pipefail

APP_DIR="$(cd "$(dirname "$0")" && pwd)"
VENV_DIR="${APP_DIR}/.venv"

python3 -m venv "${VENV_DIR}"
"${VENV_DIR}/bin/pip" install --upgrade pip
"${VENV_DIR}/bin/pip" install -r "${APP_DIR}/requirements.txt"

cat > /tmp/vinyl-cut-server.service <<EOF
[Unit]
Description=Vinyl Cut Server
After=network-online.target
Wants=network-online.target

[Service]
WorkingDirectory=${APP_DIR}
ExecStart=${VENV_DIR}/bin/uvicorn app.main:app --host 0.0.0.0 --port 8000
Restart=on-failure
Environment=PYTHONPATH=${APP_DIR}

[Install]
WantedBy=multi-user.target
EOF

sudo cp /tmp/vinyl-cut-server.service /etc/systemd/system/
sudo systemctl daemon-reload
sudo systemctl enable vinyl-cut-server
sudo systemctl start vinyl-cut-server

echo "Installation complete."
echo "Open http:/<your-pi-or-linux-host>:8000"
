@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vinyl-cut-server"
+version = "0.1.0"
+description = "A first-pass local web interface for controlling vinyl cutters over the LAN"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110.0",
+  "uvicorn>=0.29.0",
+  "jinja2>=3.1.4",
+  "python-multipart>=0.0.9",
+  "pyusb>=1.2.1",
+]
+
+[tool.setuptools]
+packages = ["app", "app.services"]

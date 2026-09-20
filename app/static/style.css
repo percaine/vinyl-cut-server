@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vinyl Cut Server</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Vinyl Cut Server</h1>
+        <p>Local browser interface for a vinyl cutter on the LAN</p>
+      </header>
+
+      <main>
+        <section class="panel">
+          <h2>Machine status</h2>
+          <div id="status-box" class="status-box">Connecting...</div>
+        </section>
+
+        <section class="panel">
+          <h2>Upload SVG</h2>
+          <form id="upload-form" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".svg,image/svg+xml" required />
+            <button type="submit">Upload</button>
+          </form>
+          <div id="upload-result" class="message"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Available devices</h2>
+          <ul id="device-list" class="list"></ul>
+        </section>
+
+        <section class="panel">
+          <h2>Create job</h2>
+          <form id="job-form">
+            <label>
+              File name
+              <input type="text" id="job-filename" placeholder="example.svg" required />
+            </label>
+            <label>
+              Device
+              <select id="job-device"></select>
+            </label>
+            <label>
+              Speed
+              <input type="number" id="job-speed" value="8" min="1" max="20" />
+            </label>
+            <label>
+              Pressure
+              <input type="number" id="job-pressure" value="12" min="1" max="30" />
+            </label>
+            <label>
+              Tool
+              <select id="job-tool">
+                <option value="autoblade">Autoblade</option>
+                <option value="cut">Cut</option>
+                <option value="pen">Pen</option>
+              </select>
+            </label>
+            <button type="submit">Queue job</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <h2>Jobs</h2>
+          <div id="jobs-list" class="jobs-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
