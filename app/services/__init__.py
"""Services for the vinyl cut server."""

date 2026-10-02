@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
+
+from app.models import CutJob, JobState
+
+
+class CutterDriver:
+    async def run_job(self, job: CutJob, update_callback: Callable[[CutJob], None]) -> None:
+        try:
+            job.status = JobState.preparing
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append("Preparing cutter session")
+            update_callback(job)
+            await asyncio.sleep(1)
+
+            if job.device_id is None:
+                raise ValueError("No cutter device selected")
+
+            job.status = JobState.cutting
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append(f"Starting cut on device {job.device_id}")
+            update_callback(job)
+
+            for percent in range(5, 101, 5):
+                if job.status == JobState.cancelled:
+                    job.logs.append("Job cancelled by user")
+                    update_callback(job)
+                    return
+
+                job.progress = percent
+                job.updated_at = datetime.now(timezone.utc).isoformat()
+                job.logs.append(f"Cut progress: {percent}%")
+                update_callback(job)
+                await asyncio.sleep(0.5)
+
+            if job.status == JobState.cancelled:
+                return
+
+            job.status = JobState.completed
+            job.progress = 100
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append("Cut completed successfully")
+            update_callback(job)
+        except Exception as exc:  # pragma: no cover - failure path for device ops
+            job.status = JobState.failed
+            job.error = str(exc)
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append(f"Job failed: {exc}")
+            update_callback(job)
+        finally:
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+
+
+class JobQueue:
+    def __init__(self) -> None:
+        self.jobs: Dict[str, CutJob] = {}
+        self._tasks: Dict[str, asyncio.Task] = {}
+
+    def create_job(self, filename: str, device_id: Optional[str], settings: Dict[str, Any]) -> CutJob:
+        job = CutJob(
+            id=f"job-{len(self.jobs) + 1:04d}",
+            filename=filename,
+            device_id=device_id,
+            settings=settings,
+        )
+        self.jobs[job.id] = job
+        return job
+
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        return [job.to_dict() for job in self.jobs.values()]
+
+    def get_job(self, job_id: str) -> Optional[CutJob]:
+        return self.jobs.get(job_id)
+
+    def cancel_job(self, job_id: str) -> Optional[CutJob]:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+            return job
+        job.status = JobState.cancelled
+        job.updated_at = datetime.now(timezone.utc).isoformat()
+        job.logs.append("Cancellation requested")
+        return job
+
+    def start_job(self, job_id: str, driver: CutterDriver, on_update: Optional[Callable[[CutJob], None]] = None) -> Optional[CutJob]:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+            return job
+        if job_id in self._tasks and not self._tasks[job_id].done():
+            return job
+
+        callback = on_update or (lambda _: None)
+        task = asyncio.create_task(driver.run_job(job, callback))
+        self._tasks[job.id] = task
+        return job
