@@ -6,7 +6,6 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from app.models import JobState
@@ -19,20 +18,22 @@ from app.services.job_queue import JobQueue
 ensure_directories()
 
 APP_DIR = Path(__file__).resolve().parent
-TEMPLATES_DIR = str(APP_DIR / "templates")
-STATIC_DIR = str(APP_DIR / "static")
+TEMPLATES_DIR = APP_DIR / "templates"
+STATIC_DIR = APP_DIR / "static"
 
 app = FastAPI(title="Vinyl Cut Server", version="0.1.0")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-templates = Jinja2Templates(directory=TEMPLATES_DIR)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 job_queue = JobQueue(db=JobDatabase())
 device_manager = DeviceManager()
 
+# Load the HTML template directly as a string
+INDEX_HTML = (TEMPLATES_DIR / "index.html").read_text()
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return INDEX_HTML
 
 
 @app.get("/api/status")
