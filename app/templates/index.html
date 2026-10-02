@@ -1,131 +1,72 @@
-from __future__ import annotations
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vinyl Cut Server</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Vinyl Cut Server</h1>
+        <p>Control your vinyl cutter from any browser on the local network</p>
+      </header>
 
-import os
-from pathlib import Path
-from typing import Any, Dict, Optional
+      <main>
+        <section class="panel">
+          <h2>Status</h2>
+          <div id="status-box" class="status-box">Connecting...</div>
+          <div id="device-list" class="list"></div>
+        </section>
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from starlette.requests import Request
+        <section class="panel">
+          <h2>Upload SVG File</h2>
+          <form id="upload-form" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".svg,image/svg+xml" required />
+            <button type="submit">Upload</button>
+          </form>
+          <div id="upload-result" class="message"></div>
+        </section>
 
-from app.models import CutJob, JobState
-from app.services.device_manager import DeviceManager
-from app.services.job_queue import CutterDriver, JobQueue
-from app.services.files import ensure_directories, get_upload_dir, safe_filename
+        <section class="panel">
+          <h2>Create Cutting Job</h2>
+          <form id="job-form">
+            <label>
+              File name
+              <input type="text" id="job-filename" placeholder="example.svg" required />
+            </label>
+            <label>
+              Device
+              <select id="job-device"></select>
+            </label>
+            <label>
+              Speed (1-10)
+              <input type="number" id="job-speed" value="8" min="1" max="10" />
+            </label>
+            <label>
+              Pressure (1-18)
+              <input type="number" id="job-pressure" value="12" min="1" max="18" />
+            </label>
+            <label>
+              Tool
+              <select id="job-tool">
+                <option value="autoblade">Autoblade</option>
+                <option value="cut">Cut</option>
+                <option value="pen">Pen</option>
+              </select>
+            </label>
+            <button type="submit">Queue Job</button>
+          </form>
+        </section>
 
-ensure_directories()
+        <section class="panel">
+          <h2>Jobs</h2>
+          <div id="jobs-list" class="jobs-list"></div>
+        </section>
+      </main>
+    </div>
 
-app = FastAPI(title="Vinyl Cut Server", version="0.1.0")
-
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
-
-job_queue = JobQueue()
-device_manager = DeviceManager()
-
-
-def emit_update() -> None:
-    pass
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-
-@app.get("/api/status")
-async def api_status():
-    return {
-        "app": "vinyl-cut-server",
-        "version": "0.1.0",
-        "status": "running",
-        "device_count": len(device_manager.scan()),
-    }
-
-
-@app.get("/api/devices")
-async def api_devices():
-    return {"devices": device_manager.scan()}
-
-
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    upload_dir = get_upload_dir()
-    filename = safe_filename(file.filename or "upload.svg")
-    destination = upload_dir / filename
-    with destination.open("wb") as handle:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
-    return {"filename": filename, "path": str(destination)}
-
-
-@app.get("/api/jobs")
-async def list_jobs():
-    return {"jobs": job_queue.list_jobs()}
-
-
-@app.post("/api/jobs")
-async def create_job(
-    filename: str = Form(...),
-    device_id: str = Form("simulated-usb-cutter"),
-    speed: int = Form(8),
-    pressure: int = Form(12),
-    tool: str = Form("autoblade"),
-):
-    job = job_queue.create_job(
-        filename=filename,
-        device_id=device_id,
-        settings={
-            "speed": speed,
-            "pressure": pressure,
-            "tool": tool,
-        },
-    )
-    return {"job": job.to_dict()}
-
-
-@app.post("/api/jobs/{job_id}/start")
-async def start_job(job_id: str):
-    job = job_queue.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.status == JobState.completed:
-        raise HTTPException(status_code=400, detail="Job already completed")
-
-    driver = CutterDriver()
-    job_queue.start_job(job_id, driver, lambda updated: None)
-    return {"job": job.to_dict()}
-
-
-@app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
-    job = job_queue.cancel_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return {"job": job.to_dict()}
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        while True:
-            await websocket.send_json({
-                "status": "connected",
-                "jobs": job_queue.list_jobs(),
-                "devices": device_manager.scan(),
-            })
-            await asyncio.sleep(2)
-    except WebSocketDisconnect:
-        return
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    <script src="/static/app.js"></script>
+  </body>
+</html>
