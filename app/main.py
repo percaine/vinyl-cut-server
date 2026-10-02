@@ -1,10 +1,7 @@
-# Start app
-
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -13,9 +10,10 @@ from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from app.models import JobState
+from app.services.cutter_driver import CutterDriver
 from app.services.device_manager import DeviceManager
-from app.services.job_queue import CutterDriver, JobQueue
 from app.services.files import ensure_directories, get_upload_dir, safe_filename
+from app.services.job_queue import JobQueue
 
 ensure_directories()
 
@@ -94,11 +92,8 @@ async def start_job(job_id: str):
     if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
         raise HTTPException(status_code=400, detail="Job cannot be started")
 
-    if job.status not in {JobState.queued, JobState.preparing}:
-        job.status = JobState.queued
-
-    driver = CutterDriver()
-    job_queue.start_job(job_id, driver, lambda updated: None)
+    job.status = JobState.queued
+    job_queue.start_job(job_id, CutterDriver(), lambda updated: None)
     return {"job": job.to_dict()}
 
 
