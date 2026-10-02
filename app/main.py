@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -11,17 +11,22 @@ from starlette.requests import Request
 
 from app.models import JobState
 from app.services.cutter_driver import CutterDriver
+from app.services.database import JobDatabase
 from app.services.device_manager import DeviceManager
 from app.services.files import ensure_directories, get_upload_dir, safe_filename
 from app.services.job_queue import JobQueue
 
 ensure_directories()
 
-app = FastAPI(title="Vinyl Cut Server", version="0.1.0")
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
+APP_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = str(APP_DIR / "templates")
+STATIC_DIR = str(APP_DIR / "static")
 
-job_queue = JobQueue()
+app = FastAPI(title="Vinyl Cut Server", version="0.1.0")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+job_queue = JobQueue(db=JobDatabase())
 device_manager = DeviceManager()
 
 
