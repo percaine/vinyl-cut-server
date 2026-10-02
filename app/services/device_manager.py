@@ -8,33 +8,36 @@ except Exception:  # pragma: no cover
     usb = None
 
 
-SILHOUETTE_USB_IDS = {
-    (0x0E21, 0x0902),
-    (0x0E21, 0x0901),
-    (0x0E21, 0x0900),
-    (0x0E21, 0x0903),
-    (0x0E21, 0x0904),
-    (0x0E21, 0x0101),
-    (0x0E21, 0x0100),
-    (0x0E21, 0x0102),
-    (0x0E21, 0x0103),
-    (0x0E21, 0x0111),
-    (0x0E21, 0x0112),
-    (0x0E21, 0x0113),
-    (0x0E21, 0x0120),
-    (0x0E21, 0x0301),
-    (0x0E21, 0x0302),
-    (0x0E21, 0x0303),
-    (0x0E21, 0x0304),
-    (0x0E21, 0x0305),
-    (0x0E21, 0x0400),
-    (0x0E21, 0x0401),
-    (0x0E21, 0x0402),
-    (0x0E21, 0x0403),
-    (0x1A40, 0x0101),
-    (0x1A40, 0x0102),
-    (0x1A40, 0x0103),
-    (0x1A40, 0x0104),
+# Complete list of all Silhouette-compatible USB devices from the inkscape-silhouette project
+# Extracted from silhouette-udev.rules and sendto_silhouette.inx
+SILHOUETTE_USB_DEVICES = {
+    # Vendor 0x3844: Silhouette Cameo 5 Alpha series (newer devices)
+    (0x3844, 0x0001): "Silhouette Cameo 5 Alpha",
+    (0x3844, 0x0002): "Silhouette Cameo 5 Alpha Plus",
+    
+    # Vendor 0x0B4D: Silhouette / Graphtec main range
+    (0x0B4D, 0x1121): "Silhouette Cameo",
+    (0x0B4D, 0x112B): "Silhouette Cameo 2",
+    (0x0B4D, 0x112F): "Silhouette Cameo 3",
+    (0x0B4D, 0x1137): "Silhouette Cameo 4",
+    (0x0B4D, 0x1138): "Silhouette Cameo 4 Plus",
+    (0x0B4D, 0x1139): "Silhouette Cameo 4 Pro",
+    (0x0B4D, 0x1140): "Silhouette Cameo 5",
+    (0x0B4D, 0x1146): "Silhouette Cameo Pro MK-II",
+    
+    # Portrait series
+    (0x0B4D, 0x1123): "Silhouette Portrait",
+    (0x0B4D, 0x1132): "Silhouette Portrait 2",
+    (0x0B4D, 0x113A): "Silhouette Portrait 3",
+    (0x0B4D, 0x113F): "Silhouette Portrait 4",
+    
+    # SD series
+    (0x0B4D, 0x111C): "Silhouette SD-1",
+    (0x0B4D, 0x111D): "Silhouette SD-2",
+    
+    # Craft Robo (compatible cutters)
+    (0x0B4D, 0x110A): "Craft Robo CC200-20",
+    (0x0B4D, 0x111A): "Craft Robo CC300-20",
 }
 
 
@@ -50,18 +53,21 @@ class DeviceManager:
                     if vendor_id is None or product_id is None:
                         continue
 
-                    if (int(vendor_id), int(product_id)) not in SILHOUETTE_USB_IDS:
+                    key = (int(vendor_id), int(product_id))
+                    if key not in SILHOUETTE_USB_DEVICES:
                         continue
 
+                    device_name = SILHOUETTE_USB_DEVICES[key]
                     devices.append(
                         {
                             "id": f"usb-{vendor_id:04x}-{product_id:04x}",
-                            "name": f"Silhouette USB device {vendor_id:04x}:{product_id:04x}",
+                            "name": device_name,
                             "kind": "usb",
                             "status": "ready",
                             "details": {
                                 "vendor_id": vendor_id,
                                 "product_id": product_id,
+                                "model": device_name,
                             },
                         }
                     )
@@ -72,12 +78,12 @@ class DeviceManager:
             devices.append(
                 {
                     "id": "simulated-usb-cutter",
-                    "name": "Simulated Silhouette cutter",
+                    "name": "Simulated Silhouette Cutter (Demo)",
                     "kind": "usb",
                     "status": "demo",
                     "details": {
                         "mode": "demo",
-                        "note": "No recognized Silhouette cutter found. Demo mode is active.",
+                        "note": "No real Silhouette cutter detected. Running in simulation mode. Supports: Cameo, Cameo 2-5, Portrait 1-4, SD-1/2, Craft Robo CC200/300.",
                     },
                 }
             )
