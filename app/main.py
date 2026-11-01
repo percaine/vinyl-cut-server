@@ -1,85 +1,141 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import asyncio
+from pathlib import Path
 
-try:
-    import usb  # type: ignore
-except Exception:  # pragma: no cover
-    usb = None
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.requests import Request
 
+from app.models import JobState
+from app.services.cutter_driver import CutterDriver
+from app.services.database import JobDatabase
+from app.services.device_manager import DeviceManager
+from app.services.files import ensure_directories, get_upload_dir, safe_filename
+from app.services.job_queue import JobQueue
 
-# Complete list of all Silhouette-compatible USB devices from the inkscape-silhouette project
-# Extracted from silhouette-udev.rules and sendto_silhouette.inx
-SILHOUETTE_USB_DEVICES = {
-    # Vendor 0x3844: Silhouette Cameo 5 Alpha series (newer devices)
-    (0x3844, 0x0001): "Silhouette Cameo 5 Alpha",
-    (0x3844, 0x0002): "Silhouette Cameo 5 Alpha Plus",
+ensure_directories()
 
-    # Vendor 0x0B4D: Silhouette / Graphtec main range
-    (0x0B4D, 0x1121): "Silhouette Cameo",
-    (0x0B4D, 0x112B): "Silhouette Cameo 2",
-    (0x0B4D, 0x112F): "Silhouette Cameo 3",
-    (0x0B4D, 0x1137): "Silhouette Cameo 4",
-    (0x0B4D, 0x1138): "Silhouette Cameo 4 Plus",
-    (0x0B4D, 0x1139): "Silhouette Cameo 4 Pro",
-    (0x0B4D, 0x1140): "Silhouette Cameo 5",
-    (0x0B4D, 0x1146): "Silhouette Cameo Pro MK-II",
+APP_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = APP_DIR / "templates"
+STATIC_DIR = APP_DIR / "static"
 
-    # Portrait series
-    (0x0B4D, 0x1123): "Silhouette Portrait",
-    (0x0B4D, 0x1132): "Silhouette Portrait 2",
-    (0x0B4D, 0x113A): "Silhouette Portrait 3",
-    (0x0B4D, 0x113F): "Silhouette Portrait 4",
+app = FastAPI(title="Vinyl Cut Server", version="0.2.0")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    # SD series
-    (0x0B4D, 0x111C): "Silhouette SD-1",
-    (0x0B4D, 0x111D): "Silhouette SD-2",
+job_queue = JobQueue(db=JobDatabase())
+device_manager = DeviceManager()
 
-    # Craft Robo (compatible cutters)
-    (0x0B4D, 0x110A): "Craft Robo CC200-20",
-    (0x0B4D, 0x111A): "Craft Robo CC300-20",
-}
+INDEX_HTML = (TEMPLATES_DIR / "index.html").read_text()
 
 
-class DeviceManager:
-    def scan(self) -> List[Dict[str, Any]]:
-        devices: List[Dict[str, Any]] = []
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return INDEX_HTML
 
-        if usb is None:
-            return devices
 
-        try:
-            for dev in usb.core.find(find_all=True):
-                vendor_id = getattr(dev, "idVendor", None)
-                product_id = getattr(dev, "idProduct", None)
-                if vendor_id is None or product_id is None:
-                    continue
+@app.get("/api/status")
+async def status():
+    devices = device_manager.scan()
+    return {
+        "app": "vinyl-cut-server",
+        "version": "0.2.0",
+        "status": "running",
+        "device_count": len(devices),
+        "devices": devices,
+    }
 
-                key = (int(vendor_id), int(product_id))
-                if key not in SILHOUETTE_USB_DEVICES:
-                    continue
 
-                device_name = SILHOUETTE_USB_DEVICES[key]
-                devices.append(
-                    {
-                        "id": f"usb-{vendor_id:04x}-{product_id:04x}",
-                        "name": device_name,
-                        "kind": "usb",
-                        "status": "ready",
-                        "details": {
-                            "vendor_id": vendor_id,
-                            "product_id": product_id,
-                            "model": device_name,
-                        },
-                    }
-                )
-        except Exception:
-            return []
+@app.get("/api/devices")
+async def devices():
+    return {"devices": device_manager.scan()}
 
-        return devices
 
-    def get_device_by_id(self, device_id: str) -> Optional[Dict[str, Any]]:
-        for device in self.scan():
-            if device["id"] == device_id:
-                return device
-        return None
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    upload_dir = get_upload_dir()
+    filename = safe_filename(file.filename or "upload.svg")
+    destination = upload_dir / filename
+    with destination.open("wb") as handle:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+    return {"filename": filename, "path": str(destination)}
+
+
+@app.get("/api/jobs")
+async def jobs():
+    return {"jobs": job_queue.list_jobs()}
+
+
+@app.post("/api/jobs")
+async def create_job(
+    filename: str = Form(...),
+    device_id: str = Form(""),
+    speed: int = Form(8),
+    pressure: int = Form(12),
+    tool: str = Form("autoblade"),
+):
+    if not filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+    if not device_id:
+        raise HTTPException(status_code=400, detail="A connected USB cutter is required")
+    if device_manager.get_device_by_id(device_id) is None:
+        raise HTTPException(status_code=400, detail="Selected device is not available")
+
+    job = job_queue.create_job(
+        filename=filename,
+        device_id=device_id,
+        settings={
+            "speed": speed,
+            "pressure": pressure,
+            "tool": tool,
+        },
+    )
+    return {"job": job.to_dict()}
+
+
+@app.post("/api/jobs/{job_id}/start")
+async def start_job(job_id: str):
+    job = job_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.device_id is None or device_manager.get_device_by_id(job.device_id) is None:
+        raise HTTPException(status_code=409, detail="Selected device is no longer available")
+    if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+        raise HTTPException(status_code=400, detail="Job cannot be started")
+
+    job.status = JobState.queued
+    job_queue.start_job(job_id, CutterDriver(), lambda updated: None)
+    return {"job": job.to_dict()}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    job = job_queue.cancel_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job": job.to_dict()}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            await websocket.send_json({
+                "jobs": job_queue.list_jobs(),
+                "devices": device_manager.scan(),
+            })
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        return
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
