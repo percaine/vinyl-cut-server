@@ -1,112 +1,153 @@
-from __future__ import annotations
+# Vinyl Cut Server
 
-import asyncio
-import shlex
-import subprocess
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Callable, List, Optional
+A local web app for controlling Silhouette-compatible vinyl cutters from a browser on another computer on the same local network.
 
-from app.config import settings
-from app.models import CutJob, JobState
-from app.services.files import get_upload_dir
+This version runs as a local web interface on a Raspberry Pi, Armbian box, or Linux PC and exposes a simple API for:
 
+- uploading SVG files
+- scanning detected USB devices
+- queuing and starting jobs
+- viewing live progress and logs
+- cancelling jobs
 
-class CutterDriver:
-    def _resolve_backend_command(self) -> Optional[List[str]]:
-        if settings.cutter_backend_command:
-            return shlex.split(settings.cutter_backend_command)
+This is intentionally a practical local-first implementation for real cutter hardware.
 
-        script_path = Path(settings.cutter_backend_script)
-        if script_path.exists() and script_path.is_file():
-            return [sys.executable, str(script_path)]
+## Features
 
-        return None
+- FastAPI backend
+- browser dashboard
+- SQLite-backed job persistence
+- USB device scanning via pyusb for supported Silhouette devices
+- real cutter execution flow for connected devices
+- install script and systemd example
 
-    def _resolve_upload_path(self, job: CutJob) -> Path:
-        candidate = (get_upload_dir() / job.filename).resolve()
-        if candidate.exists():
-            return candidate
+## Requirements
 
-        direct = Path(job.filename).expanduser().resolve()
-        if direct.exists():
-            return direct
+- Python 3.10+
+- USB access for a connected Silhouette-compatible cutter
+- A real backend command or script for actual cutter execution
 
-        raise FileNotFoundError(f"Uploaded file not found: {job.filename}")
+## Quick start
 
-    def _build_backend_command(self, job: CutJob, file_path: Path) -> List[str]:
-        command = self._resolve_backend_command()
-        if not command:
-            raise RuntimeError(
-                "No real cutter backend is configured. Set CUTTER_BACKEND_COMMAND to a real Silhouette backend executable or provide a valid CUTTER_BACKEND_SCRIPT."
-            )
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-        args = [
-            str(file_path),
-            "--device-id",
-            str(job.device_id),
-            "--speed",
-            str(job.settings.get("speed", 8)),
-            "--pressure",
-            str(job.settings.get("pressure", 12)),
-            "--tool",
-            str(job.settings.get("tool", "autoblade")),
-        ]
+Then open:
 
-        return command + args
+```text
+http://<your-pi-or-linux-host>:8000
+```
 
-    def _run_backend_command(self, command: List[str]) -> str:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
-        if completed.returncode != 0:
-            message = output or f"backend exited with code {completed.returncode}"
-            raise RuntimeError(message)
-        return output
+## Local network access
 
-    async def run_job(self, job: CutJob, update_callback: Callable[[CutJob], None]) -> None:
-        try:
-            job.status = JobState.preparing
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append("Preparing real cutter session")
-            update_callback(job)
+This app is intended to be used from another PC on the same LAN, for example by visiting:
 
-            if job.device_id is None:
-                raise ValueError("No cutter device selected")
+```text
+http://192.168.1.50:8000
+```
 
-            file_path = self._resolve_upload_path(job)
-            backend_command = self._build_backend_command(job, file_path)
+## Installing on an Armbian box
 
-            job.status = JobState.cutting
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append(f"Executing real cutter backend for device {job.device_id}")
-            job.logs.append(f"Command: {' '.join(backend_command)}")
-            update_callback(job)
+Run these commands on the target device:
 
-            backend_output = await asyncio.to_thread(self._run_backend_command, backend_command)
-            if backend_output:
-                job.logs.append(backend_output)
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip libusb-1.0-0-dev
 
-            if job.status == JobState.cancelled:
-                job.logs.append("Job cancelled before backend completion")
-                update_callback(job)
-                return
+cd /opt
+sudo git clone https://github.com/percaine/vinyl-cut-server.git
+cd vinyl-cut-server
 
-            job.status = JobState.completed
-            job.progress = 100
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append("Cut completed successfully")
-            update_callback(job)
-        except Exception as exc:  # pragma: no cover - failure path for real device ops
-            job.status = JobState.failed
-            job.error = str(exc)
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append(f"Job failed: {exc}")
-            update_callback(job)
-        finally:
-            job.updated_at = datetime.now(timezone.utc).isoformat()
+git checkout remove-demo-mode
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Then start it manually:
+
+```bash
+source /opt/vinyl-cut-server/.venv/bin/activate
+cd /opt/vinyl-cut-server
+
+export CUTTER_BACKEND_COMMAND="python3 /path/to/your/silhouette/backend.py"
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Open the app from a browser on the same network:
+
+```text
+http://<armbian-ip>:8000
+```
+
+## Running as a systemd service
+
+Create a service file:
+
+```bash
+sudo nano /etc/systemd/system/vinyl-cut-server.service
+```
+
+With contents:
+
+```ini
+[Unit]
+Description=Vinyl Cut Server
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/vinyl-cut-server
+Environment="CUTTER_BACKEND_COMMAND=python3 /path/to/your/silhouette/backend.py"
+ExecStart=/opt/vinyl-cut-server/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable vinyl-cut-server
+sudo systemctl start vinyl-cut-server
+sudo systemctl status vinyl-cut-server
+```
+
+## Real device requirements
+
+This app requires a physically connected Silhouette-compatible USB cutter. It does not include demo or simulated device behavior.
+
+The actual job execution path requires a real backend command or script. Configure one using either:
+
+```bash
+export CUTTER_BACKEND_COMMAND="/path/to/real/backend"
+```
+
+or:
+
+```bash
+export CUTTER_BACKEND_SCRIPT="/path/to/real/backend.py"
+```
+
+If no real backend is configured, the app will fail with a clear backend configuration error instead of running a simulated cut.
+
+## Notes
+
+This is intentionally a local-first prototype for real hardware. It is not a demo or simulation mode.
+
+## Next steps
+
+- integrate the upstream Silhouette backend workflow directly
+- add richer device metadata and connection diagnostics
+- improve job history, persistence, and recovery
+- add authentication and local-only network binding
+- add more formal error reporting for cutter failures
