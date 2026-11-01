@@ -1,119 +1,142 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Dict, List, Optional, Set
+from pathlib import Path
 
-from app.models import CutJob, JobState
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.requests import Request
+
+from app.models import JobState
+from app.services.cutter_driver import CutterDriver
 from app.services.database import JobDatabase
+from app.services.device_manager import DeviceManager
+from app.services.files import ensure_directories, get_upload_dir, safe_filename
+from app.services.job_queue import JobQueue
+
+ensure_directories()
+
+APP_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = APP_DIR / "templates"
+STATIC_DIR = APP_DIR / "static"
+
+app = FastAPI(title="Vinyl Cut Server", version="0.2.0")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+job_queue = JobQueue(db=JobDatabase())
+device_manager = DeviceManager()
+
+# Load the HTML template directly as a string
+INDEX_HTML = (TEMPLATES_DIR / "index.html").read_text()
 
 
-class CutterDriver:
-    async def run_job(self, job: CutJob, update_callback: Callable[[CutJob], None]) -> None:
-        try:
-            job.status = JobState.preparing
-            job.logs.append("Preparing cutter session")
-            update_callback(job)
-            await asyncio.sleep(1)
-
-            if job.device_id is None:
-                raise ValueError("No cutter device selected")
-
-            job.status = JobState.cutting
-            job.logs.append(f"Starting cut on device {job.device_id}")
-            update_callback(job)
-
-            for percent in range(5, 101, 5):
-                if job.status == JobState.cancelled:
-                    job.logs.append("Job cancelled by user")
-                    update_callback(job)
-                    return
-                job.progress = percent
-                job.logs.append(f"Cut progress: {percent}%")
-                update_callback(job)
-                await asyncio.sleep(0.5)
-
-            if job.status == JobState.cancelled:
-                return
-
-            job.status = JobState.completed
-            job.progress = 100
-            job.logs.append("Cut completed successfully")
-            update_callback(job)
-        except Exception as exc:
-            job.status = JobState.failed
-            job.error = str(exc)
-            job.logs.append(f"Job failed: {exc}")
-            update_callback(job)
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return INDEX_HTML
 
 
-class JobQueue:
-    def __init__(self, db: Optional[JobDatabase] = None) -> None:
-        self.jobs: Dict[str, CutJob] = {}
-        self._tasks: Dict[str, asyncio.Task] = {}
-        self._websocket_callbacks: Set[Callable[[CutJob], None]] = set()
-        self.db = db or JobDatabase()
-        self._load_jobs_from_db()
+@app.get("/api/status")
+async def status():
+    devices = device_manager.scan()
+    return {
+        "app": "vinyl-cut-server",
+        "version": "0.2.0",
+        "status": "running",
+        "device_count": len(devices),
+        "devices": devices,
+    }
 
-    def _load_jobs_from_db(self) -> None:
-        for job in self.db.list_jobs():
-            self.jobs[job.id] = job
 
-    def create_job(self, filename: str, device_id: Optional[str], settings: Dict[str, Any]) -> CutJob:
-        job_num = len(self.jobs) + 1
-        job = CutJob(
-            id=f"job-{job_num:04d}",
-            filename=filename,
-            device_id=device_id,
-            settings=settings,
-        )
-        self.jobs[job.id] = job
-        self.db.save_job(job)
-        return job
+@app.get("/api/devices")
+async def devices():
+    return {"devices": device_manager.scan()}
 
-    def list_jobs(self) -> List[Dict[str, Any]]:
-        return [job.to_dict() for job in self.jobs.values()]
 
-    def get_job(self, job_id: str) -> Optional[CutJob]:
-        return self.jobs.get(job_id)
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    upload_dir = get_upload_dir()
+    filename = safe_filename(file.filename or "upload.svg")
+    destination = upload_dir / filename
+    with destination.open("wb") as handle:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+    return {"filename": filename, "path": str(destination)}
 
-    def cancel_job(self, job_id: str) -> Optional[CutJob]:
-        job = self.jobs.get(job_id)
-        if job is None:
-            return None
-        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
-            return job
-        job.status = JobState.cancelled
-        job.logs.append("Cancellation requested")
-        self.db.save_job(job)
-        return job
 
-    def start_job(
-        self, job_id: str, driver: CutterDriver, on_update: Optional[Callable[[CutJob], None]] = None
-    ) -> Optional[CutJob]:
-        job = self.jobs.get(job_id)
-        if job is None:
-            return None
-        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
-            return job
-        if job_id in self._tasks and not self._tasks[job_id].done():
-            return job
+@app.get("/api/jobs")
+async def jobs():
+    return {"jobs": job_queue.list_jobs()}
 
-        def callback_wrapper(updated_job: CutJob) -> None:
-            self.db.save_job(updated_job)
-            if on_update:
-                on_update(updated_job)
-            for ws_callback in self._websocket_callbacks:
-                try:
-                    ws_callback(updated_job)
-                except Exception:
-                    pass
 
-        task = asyncio.create_task(driver.run_job(job, callback_wrapper))
-        self._tasks[job_id] = task
-        return job
+@app.post("/api/jobs")
+async def create_job(
+    filename: str = Form(...),
+    device_id: str = Form(""),
+    speed: int = Form(8),
+    pressure: int = Form(12),
+    tool: str = Form("autoblade"),
+):
+    if not filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+    if not device_id:
+        raise HTTPException(status_code=400, detail="A connected USB cutter is required")
+    if device_manager.get_device_by_id(device_id) is None:
+        raise HTTPException(status_code=400, detail="Selected device is not available")
 
-    def register_websocket_callback(self, callback: Callable[[CutJob], None]) -> None:
-        self._websocket_callbacks.add(callback)
+    job = job_queue.create_job(
+        filename=filename,
+        device_id=device_id,
+        settings={
+            "speed": speed,
+            "pressure": pressure,
+            "tool": tool,
+        },
+    )
+    return {"job": job.to_dict()}
 
-    def unregister_websocket_callback(self, callback: Callable[[CutJob], None]) -> None:
-        self._websocket_callbacks.discard(callback)
+
+@app.post("/api/jobs/{job_id}/start")
+async def start_job(job_id: str):
+    job = job_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.device_id is None or device_manager.get_device_by_id(job.device_id) is None:
+        raise HTTPException(status_code=409, detail="Selected device is no longer available")
+    if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+        raise HTTPException(status_code=400, detail="Job cannot be started")
+
+    job.status = JobState.queued
+    job_queue.start_job(job_id, CutterDriver(), lambda updated: None)
+    return {"job": job.to_dict()}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    job = job_queue.cancel_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job": job.to_dict()}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            await websocket.send_json({
+                "jobs": job_queue.list_jobs(),
+                "devices": device_manager.scan(),
+            })
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        return
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

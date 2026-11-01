@@ -1,178 +1,86 @@
-const statusBox = document.getElementById('status-box');
-const deviceList = document.getElementById('device-list');
-const jobsList = document.getElementById('jobs-list');
-const uploadForm = document.getElementById('upload-form');
-const jobForm = document.getElementById('job-form');
-const uploadResult = document.getElementById('upload-result');
-const jobDevice = document.getElementById('job-device');
-const jobFilename = document.getElementById('job-filename');
+from __future__ import annotations
 
-let ws = null;
-const wsQueue = [];
+import asyncio
+from typing import Any, Callable, Dict, List, Optional, Set
 
-function connectWebSocket() {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-  ws.onopen = () => {
-    console.log('WebSocket connected');
-    while (wsQueue.length > 0) {
-      const msg = wsQueue.shift();
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(msg);
-      }
-    }
-  };
-  ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.jobs) {
-      updateJobsDisplay(data.jobs);
-    }
-    if (data.devices) {
-      updateDevicesDisplay(data.devices);
-    }
-  };
-  ws.onclose = () => {
-    console.log('WebSocket closed. Reconnecting in 3s...');
-    setTimeout(connectWebSocket, 3000);
-  };
-}
+from app.models import CutJob, JobState
+from app.services.cutter_driver import CutterDriver
+from app.services.database import JobDatabase
 
-async function loadStatus() {
-  try {
-    const response = await fetch('/api/status');
-    const data = await response.json();
-    statusBox.innerHTML = `
-      <strong>Status:</strong> ${data.status}<br>
-      <strong>Version:</strong> ${data.version}<br>
-      <strong>Connected Devices:</strong> ${data.device_count}
-    `;
-  } catch (err) {
-    statusBox.textContent = 'Error loading status';
-  }
-}
 
-function updateDevicesDisplay(devices) {
-  deviceList.innerHTML = '';
-  jobDevice.innerHTML = '';
-  devices.forEach((device) => {
-    const item = document.createElement('li');
-    item.innerHTML = `
-      <strong>${device.name}</strong><br>
-      <small>${device.kind} | ${device.status}</small>
-    `;
-    deviceList.appendChild(item);
+class JobQueue:
+    def __init__(self, db: Optional[JobDatabase] = None) -> None:
+        self.jobs: Dict[str, CutJob] = {}
+        self._tasks: Dict[str, asyncio.Task] = {}
+        self._websocket_callbacks: Set[Callable[[CutJob], None]] = set()
+        self.db = db or JobDatabase()
+        self._load_jobs_from_db()
 
-    const option = document.createElement('option');
-    option.value = device.id;
-    option.textContent = `${device.name} (${device.kind})`;
-    jobDevice.appendChild(option);
-  });
-}
+    def _load_jobs_from_db(self) -> None:
+        for job in self.db.list_jobs():
+            self.jobs[job.id] = job
 
-function updateJobsDisplay(jobs) {
-  jobsList.innerHTML = '';
+    def create_job(self, filename: str, device_id: Optional[str], settings: Dict[str, Any]) -> CutJob:
+        if not device_id:
+            raise ValueError("A device must be selected before creating a job")
 
-  if (!jobs.length) {
-    jobsList.innerHTML = '<div class="job-card">No jobs yet.</div>';
-    return;
-  }
+        job_num = len(self.jobs) + 1
+        job = CutJob(
+            id=f"job-{job_num:04d}",
+            filename=filename,
+            device_id=device_id,
+            settings=settings,
+        )
+        self.jobs[job.id] = job
+        self.db.save_job(job)
+        return job
 
-  jobs.forEach((job) => {
-    const card = document.createElement('div');
-    card.className = 'job-card';
-    const statusColor = job.status === 'completed' ? '#22c55e' : job.status === 'failed' ? '#ef4444' : '#2563eb';
-    card.style.borderLeft = `4px solid ${statusColor}`;
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        return [job.to_dict() for job in self.jobs.values()]
 
-    const logsHtml = job.logs.slice(-3).map(log => `<div style="font-size:0.85em; color:#94a3b8; margin-top:0.2rem;">${escapeHtml(log)}</div>`).join('');
+    def get_job(self, job_id: str) -> Optional[CutJob]:
+        return self.jobs.get(job_id)
 
-    card.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div>
-          <strong>${escapeHtml(job.filename)}</strong>
-          <div style="font-size:0.9em; color:#9ca3af; margin-top:0.2rem;">${job.id}</div>
-        </div>
-        <div style="text-align:right;">
-          <span style="font-weight:bold; color:${statusColor};">${job.status}</span>
-        </div>
-      </div>
-      <div class="progress-bar"><span class="progress-fill" style="width:${job.progress}%"></span></div>
-      <div style="font-size:0.9em; color:#cbd5e1;">${job.progress}%</div>
-      ${logsHtml}
-      <div style="margin-top:0.6rem; display:flex; gap:0.4rem;">
-        ${job.status === 'queued' || job.status === 'preparing' ? `<button class="btn-start" data-id="${job.id}">Start</button>` : ''}
-        ${job.status === 'cutting' || job.status === 'preparing' ? `<button class="btn-cancel" data-id="${job.id}">Cancel</button>` : ''}
-      </div>
-    `;
-    jobsList.appendChild(card);
-  });
-}
+    def cancel_job(self, job_id: str) -> Optional[CutJob]:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+            return job
+        job.status = JobState.cancelled
+        job.logs.append("Cancellation requested")
+        self.db.save_job(job)
+        return job
 
-function escapeHtml(text) {
-  const map = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'};
-  return text.replace(/[&<>"']/g, m => map[m]);
-}
+    def start_job(
+        self, job_id: str, driver: CutterDriver, on_update: Optional[Callable[[CutJob], None]] = None
+    ) -> Optional[CutJob]:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status in {JobState.completed, JobState.cancelled, JobState.failed}:
+            return job
+        if job_id in self._tasks and not self._tasks[job_id].done():
+            return job
+        if job.device_id is None:
+            raise ValueError("A device must be selected before starting a job")
 
-uploadForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const formData = new FormData(uploadForm);
-  try {
-    const response = await fetch('/api/upload', {
-      method: 'POST',
-      body: formData,
-    });
-    const result = await response.json();
-    uploadResult.textContent = `✓ Uploaded: ${result.filename}`;
-    jobFilename.value = result.filename;
-    uploadForm.reset();
-  } catch (err) {
-    uploadResult.textContent = `✗ Upload failed: ${err}`;
-  }
-});
+        def callback_wrapper(updated_job: CutJob) -> None:
+            self.db.save_job(updated_job)
+            if on_update:
+                on_update(updated_job)
+            for ws_callback in self._websocket_callbacks:
+                try:
+                    ws_callback(updated_job)
+                except Exception:
+                    pass
 
-jobForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const formData = new FormData();
-  formData.append('filename', jobFilename.value);
-  formData.append('device_id', jobDevice.value);
-  formData.append('speed', document.getElementById('job-speed').value);
-  formData.append('pressure', document.getElementById('job-pressure').value);
-  formData.append('tool', document.getElementById('job-tool').value);
+        task = asyncio.create_task(driver.run_job(job, callback_wrapper))
+        self._tasks[job_id] = task
+        return job
 
-  try {
-    const response = await fetch('/api/jobs', {
-      method: 'POST',
-      body: formData,
-    });
-    const data = await response.json();
-    uploadResult.textContent = `✓ Job queued: ${data.job.id}`;
-    jobForm.reset();
-  } catch (err) {
-    uploadResult.textContent = `✗ Failed to queue job: ${err}`;
-  }
-});
+    def register_websocket_callback(self, callback: Callable[[CutJob], None]) -> None:
+        self._websocket_callbacks.add(callback)
 
-jobsList.addEventListener('click', async (event) => {
-  const btn = event.target.closest('button');
-  if (!btn) return;
-  const id = btn.dataset.id;
-
-  if (btn.classList.contains('btn-start')) {
-    try {
-      await fetch(`/api/jobs/${id}/start`, { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to start job:', err);
-    }
-  }
-
-  if (btn.classList.contains('btn-cancel')) {
-    try {
-      await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to cancel job:', err);
-    }
-  }
-});
-
-loadStatus();
-connectWebSocket();
-setInterval(loadStatus, 10000);
+    def unregister_websocket_callback(self, callback: Callable[[CutJob], None]) -> None:
+        self._websocket_callbacks.discard(callback)

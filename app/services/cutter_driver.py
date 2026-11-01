@@ -1,53 +1,58 @@
-from __future__ import annotations
+# Vinyl Cut Server
 
-import asyncio
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+A local web app for controlling Silhouette-compatible vinyl cutters from a browser on the same network.
 
-from app.models import CutJob, JobState
+This version runs as a local web interface on a Raspberry Pi or Linux PC and exposes a simple API for:
 
+- uploading SVG files
+- scanning detected USB devices
+- queuing and starting jobs
+- viewing live progress and logs
+- cancelling jobs
 
-class CutterDriver:
-    async def run_job(self, job: CutJob, update_callback: Callable[[CutJob], None]) -> None:
-        try:
-            job.status = JobState.preparing
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append("Preparing cutter session")
-            update_callback(job)
-            await asyncio.sleep(1)
+This is intentionally a practical local-first implementation for real cutter hardware.
 
-            if job.device_id is None:
-                raise ValueError("No cutter device selected")
+## Features
 
-            job.status = JobState.cutting
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append(f"Starting cut on device {job.device_id}")
-            update_callback(job)
+- FastAPI backend
+- browser dashboard
+- in-memory job queue with SQLite persistence
+- USB device scanning via pyusb for supported Silhouette devices
+- real cutter execution flow for connected devices
+- install script and systemd example
 
-            for percent in range(5, 101, 5):
-                if job.status == JobState.cancelled:
-                    job.logs.append("Job cancelled by user")
-                    update_callback(job)
-                    return
-                job.progress = percent
-                job.updated_at = datetime.now(timezone.utc).isoformat()
-                job.logs.append(f"Cut progress: {percent}%")
-                update_callback(job)
-                await asyncio.sleep(0.5)
+## Quick start
 
-            if job.status == JobState.cancelled:
-                return
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-            job.status = JobState.completed
-            job.progress = 100
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append("Cut completed successfully")
-            update_callback(job)
-        except Exception as exc:  # pragma: no cover - failure path for device ops
-            job.status = JobState.failed
-            job.error = str(exc)
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            job.logs.append(f"Job failed: {exc}")
-            update_callback(job)
-        finally:
-            job.updated_at = datetime.now(timezone.utc).isoformat()
+Then open:
+
+```text
+http://<your-pi-or-linux-host>:8000
+```
+
+## Local network access
+
+This app is intended to be used from another PC on the same LAN, for example by visiting:
+
+```text
+http://192.168.1.50:8000
+```
+
+## Notes
+
+This app requires a physically connected Silhouette-compatible USB cutter. It does not include demo or simulated device behavior.
+
+## Next steps
+
+- directly run the upstream `sendto_silhouette.py` workflow as a backend executor
+- integrate real USB/Bluetooth detection and control
+- add queue persistence with SQLite
+- add file previews and richer job history
+- add authentication and local-only network binding
+
