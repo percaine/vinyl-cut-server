@@ -1,206 +1,112 @@
-const statusBox = document.getElementById('status-box');
-const deviceList = document.getElementById('device-list');
-const jobsList = document.getElementById('jobs-list');
-const uploadForm = document.getElementById('upload-form');
-const jobForm = document.getElementById('job-form');
-const uploadResult = document.getElementById('upload-result');
-const jobDevice = document.getElementById('job-device');
-const jobFilename = document.getElementById('job-filename');
+from __future__ import annotations
 
-let ws = null;
-const wsQueue = [];
+import asyncio
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, List, Optional
 
-function connectWebSocket() {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-  ws.onopen = () => {
-    console.log('WebSocket connected');
-    while (wsQueue.length > 0) {
-      const msg = wsQueue.shift();
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(msg);
-      }
-    }
-  };
-  ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.jobs) {
-      updateJobsDisplay(data.jobs);
-    }
-    if (data.devices) {
-      updateDevicesDisplay(data.devices);
-    }
-  };
-  ws.onclose = () => {
-    console.log('WebSocket closed. Reconnecting in 3s...');
-    setTimeout(connectWebSocket, 3000);
-  };
-}
+from app.config import settings
+from app.models import CutJob, JobState
+from app.services.files import get_upload_dir
 
-async function loadStatus() {
-  try {
-    const response = await fetch('/api/status');
-    const data = await response.json();
-    const deviceSummary = data.device_count === 0
-      ? 'No compatible Cutter connected'
-      : `${data.device_count} cutter connected`;
 
-    statusBox.innerHTML = `
-      <strong>Status:</strong> ${data.status}<br>
-      <strong>Version:</strong> ${data.version}<br>
-      <strong>Devices:</strong> ${deviceSummary}
-    `;
-  } catch (err) {
-    statusBox.textContent = 'Error loading status';
-  }
-}
+class CutterDriver:
+    def _resolve_backend_command(self) -> Optional[List[str]]:
+        if settings.cutter_backend_command:
+            return shlex.split(settings.cutter_backend_command)
 
-function updateDevicesDisplay(devices) {
-  deviceList.innerHTML = '';
-  jobDevice.innerHTML = '';
+        script_path = Path(settings.cutter_backend_script)
+        if script_path.exists() and script_path.is_file():
+            return [sys.executable, str(script_path)]
 
-  if (!Array.isArray(devices) || devices.length === 0) {
-    const item = document.createElement('li');
-    item.textContent = 'No compatible Silhouette cutter detected.';
-    deviceList.appendChild(item);
+        return None
 
-    const option = document.createElement('option');
-    option.value = '';
-    option.textContent = 'No device available';
-    jobDevice.appendChild(option);
-    jobDevice.disabled = true;
-    return;
-  }
+    def _resolve_upload_path(self, job: CutJob) -> Path:
+        candidate = (get_upload_dir() / job.filename).resolve()
+        if candidate.exists():
+            return candidate
 
-  jobDevice.disabled = false;
-  devices.forEach((device) => {
-    const item = document.createElement('li');
-    item.innerHTML = `
-      <strong>${device.name}</strong><br>
-      <small>${device.kind} | ${device.status}</small>
-    `;
-    deviceList.appendChild(item);
+        direct = Path(job.filename).expanduser().resolve()
+        if direct.exists():
+            return direct
 
-    const option = document.createElement('option');
-    option.value = device.id;
-    option.textContent = `${device.name} (${device.kind})`;
-    jobDevice.appendChild(option);
-  });
-}
+        raise FileNotFoundError(f"Uploaded file not found: {job.filename}")
 
-function updateJobsDisplay(jobs) {
-  jobsList.innerHTML = '';
+    def _build_backend_command(self, job: CutJob, file_path: Path) -> List[str]:
+        command = self._resolve_backend_command()
+        if not command:
+            raise RuntimeError(
+                "No real cutter backend is configured. Set CUTTER_BACKEND_COMMAND to a real Silhouette backend executable or provide a valid CUTTER_BACKEND_SCRIPT."
+            )
 
-  if (!jobs.length) {
-    jobsList.innerHTML = '<div class="job-card">No jobs yet.</div>';
-    return;
-  }
+        args = [
+            str(file_path),
+            "--device-id",
+            str(job.device_id),
+            "--speed",
+            str(job.settings.get("speed", 8)),
+            "--pressure",
+            str(job.settings.get("pressure", 12)),
+            "--tool",
+            str(job.settings.get("tool", "autoblade")),
+        ]
 
-  jobs.forEach((job) => {
-    const card = document.createElement('div');
-    card.className = 'job-card';
-    const statusColor = job.status === 'completed' ? '#22c55e' : job.status === 'failed' ? '#ef4444' : '#2563eb';
-    card.style.borderLeft = `4px solid ${statusColor}`;
+        return command + args
 
-    const logsHtml = job.logs.slice(-3).map(log => `<div style="font-size:0.85em; color:#94a3b8; margin-top:0.2rem;">${escapeHtml(log)}</div>`).join('');
+    def _run_backend_command(self, command: List[str]) -> str:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
+        if completed.returncode != 0:
+            message = output or f"backend exited with code {completed.returncode}"
+            raise RuntimeError(message)
+        return output
 
-    card.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div>
-          <strong>${escapeHtml(job.filename)}</strong>
-          <div style="font-size:0.9em; color:#9ca3af; margin-top:0.2rem;">${job.id}</div>
-        </div>
-        <div style="text-align:right;">
-          <span style="font-weight:bold; color:${statusColor};">${job.status}</span>
-        </div>
-      </div>
-      <div class="progress-bar"><span class="progress-fill" style="width:${job.progress}%"></span></div>
-      <div style="font-size:0.9em; color:#cbd5e1;">${job.progress}%</div>
-      ${logsHtml}
-      <div style="margin-top:0.6rem; display:flex; gap:0.4rem;">
-        ${job.status === 'queued' || job.status === 'preparing' ? `<button class="btn-start" data-id="${job.id}">Start</button>` : ''}
-        ${job.status === 'cutting' || job.status === 'preparing' ? `<button class="btn-cancel" data-id="${job.id}">Cancel</button>` : ''}
-      </div>
-    `;
-    jobsList.appendChild(card);
-  });
-}
+    async def run_job(self, job: CutJob, update_callback: Callable[[CutJob], None]) -> None:
+        try:
+            job.status = JobState.preparing
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append("Preparing real cutter session")
+            update_callback(job)
 
-function escapeHtml(text) {
-  const map = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'};
-  return text.replace(/[&<>"']/g, m => map[m]);
-}
+            if job.device_id is None:
+                raise ValueError("No cutter device selected")
 
-uploadForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const formData = new FormData(uploadForm);
-  try {
-    const response = await fetch('/api/upload', {
-      method: 'POST',
-      body: formData,
-    });
-    const result = await response.json();
-    uploadResult.textContent = `✓ Uploaded: ${result.filename}`;
-    jobFilename.value = result.filename;
-    uploadForm.reset();
-  } catch (err) {
-    uploadResult.textContent = `✗ Upload failed: ${err}`;
-  }
-});
+            file_path = self._resolve_upload_path(job)
+            backend_command = self._build_backend_command(job, file_path)
 
-jobForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
+            job.status = JobState.cutting
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append(f"Executing real cutter backend for device {job.device_id}")
+            job.logs.append(f"Command: {' '.join(backend_command)}")
+            update_callback(job)
 
-  if (!jobDevice.value) {
-    uploadResult.textContent = '✗ No compatible cutter detected. Connect a Silhouette cutter and refresh the page.';
-    return;
-  }
+            backend_output = await asyncio.to_thread(self._run_backend_command, backend_command)
+            if backend_output:
+                job.logs.append(backend_output)
 
-  const formData = new FormData();
-  formData.append('filename', jobFilename.value);
-  formData.append('device_id', jobDevice.value);
-  formData.append('speed', document.getElementById('job-speed').value);
-  formData.append('pressure', document.getElementById('job-pressure').value);
-  formData.append('tool', document.getElementById('job-tool').value);
+            if job.status == JobState.cancelled:
+                job.logs.append("Job cancelled before backend completion")
+                update_callback(job)
+                return
 
-  try {
-    const response = await fetch('/api/jobs', {
-      method: 'POST',
-      body: formData,
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || 'Failed to queue job');
-    }
-    uploadResult.textContent = `✓ Job queued: ${data.job.id}`;
-    jobForm.reset();
-  } catch (err) {
-    uploadResult.textContent = `✗ Failed to queue job: ${err}`;
-  }
-});
-
-jobsList.addEventListener('click', async (event) => {
-  const btn = event.target.closest('button');
-  if (!btn) return;
-  const id = btn.dataset.id;
-
-  if (btn.classList.contains('btn-start')) {
-    try {
-      await fetch(`/api/jobs/${id}/start`, { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to start job:', err);
-    }
-  }
-
-  if (btn.classList.contains('btn-cancel')) {
-    try {
-      await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to cancel job:', err);
-    }
-  }
-});
-
-loadStatus();
-connectWebSocket();
-setInterval(loadStatus, 10000);
+            job.status = JobState.completed
+            job.progress = 100
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append("Cut completed successfully")
+            update_callback(job)
+        except Exception as exc:  # pragma: no cover - failure path for real device ops
+            job.status = JobState.failed
+            job.error = str(exc)
+            job.updated_at = datetime.now(timezone.utc).isoformat()
+            job.logs.append(f"Job failed: {exc}")
+            update_callback(job)
+        finally:
+            job.updated_at = datetime.now(timezone.utc).isoformat()
